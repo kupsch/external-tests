@@ -3,7 +3,7 @@
 // an object, and on ppc64 the Power ABI v2 TOC handling for an object that was
 // excluded and so is parsed one function at a time.
 //
-//   exclusion_test              run all six scenarios, verbosely
+//   exclusion_test              run all seven scenarios, verbosely
 //   exclusion_test <scenario>   run one scenario (this is what ctest does)
 //
 //   create       processCreate
@@ -20,9 +20,12 @@
 //                entitled to its own answer: as an excluded dependency, named
 //                outright to openBinary, and as a dependency again once the
 //                patterns have been cleared
+//   callee       a call inside a function parsed on demand names its callee,
+//                which on ppc64 means Dyninst parsed the global entry the
+//                call's local-entry target belongs to
 //
-// create, attach and dlopen need ProcControl.  rewrite, rewrite-dep and reopen
-// do not.
+// create, attach and dlopen need ProcControl.  rewrite, rewrite-dep, reopen
+// and callee do not.
 //
 // Every scenario runs twice, once as a baseline and once with the library
 // excluded, and both must reach the same answers.  For the rewriting scenarios
@@ -86,7 +89,8 @@ enum class Scenario
     Dlopen,
     Rewrite,
     RewriteDep,
-    Reopen
+    Reopen,
+    Callee
 };
 
 
@@ -98,7 +102,8 @@ static const std::vector<Scenario> &allScenarios()
                                                Scenario::Dlopen,
                                                Scenario::Rewrite,
                                                Scenario::RewriteDep,
-                                               Scenario::Reopen };
+                                               Scenario::Reopen,
+                                               Scenario::Callee };
     return all;
 }
 
@@ -111,7 +116,8 @@ static const std::map<std::string, Scenario> &scenarioByName()
         { "dlopen",      Scenario::Dlopen },
         { "rewrite",     Scenario::Rewrite },
         { "rewrite-dep", Scenario::RewriteDep },
-        { "reopen",      Scenario::Reopen }
+        { "reopen",      Scenario::Reopen },
+        { "callee",      Scenario::Callee }
     };
     return byName;
 }
@@ -812,6 +818,88 @@ static int sceneReopen(BPatch &bpatch, bool exclude)
 }
 
 
+// A function parsed on demand is parsed with no hints, so the parse names
+// whatever it discovers by following control flow out of it.  Where that lands
+// on a function the symbol table already names, the two have to be brought
+// together, or a call site reports an invented name for a callee that has a
+// perfectly good one.
+//
+// On ppc64 (ELFv2) they do not even land on the same address.  A function that
+// uses the TOC has a global entry, which establishes r2, and a local entry
+// eight bytes later, which skips it; the symbol sits on the global entry, and
+// a call that binds inside the object is aimed at the local entry.  So the
+// parse creates a function at the local entry with no symbol on it, and the
+// name appears only once Dyninst parses the global entry it belongs to and
+// pairs the two.  Elsewhere there is one entry point, and this is the plain
+// case: a call inside an on-demand-parsed function names its callee.
+//
+// Either way the property is the same one, and it is a property of the parse
+// rather than of what has been asked for since: see the lookup note below.
+static int sceneCallee(BPatch &bpatch, bool exclude)
+{
+    BPatch_binaryEdit *be = bpatch.openBinary("./mutatee", true /* dependencies */);
+    check(be != NULL, "openBinary of the executable");
+    if (!be)
+        return 1;
+    BPatch_image *img = be->getImage();
+
+    BPatch_object *dep = findObj(img, "libtoc");
+    check(dep != NULL, "dependency opened");
+    if (!dep)
+        return 1;
+
+    size_t n = funcCount(dep);
+    check(exclude ? (n == 0) : (n > 0),
+          exclude ? "excluded dependency has no CFG up front"
+                  : "dependency parsed up front");
+
+    // The caller is the only name this scenario looks up.  Looking the callee
+    // up as well would settle its identity by a second route -- the by-name
+    // lookup pairs the entry points itself -- and the check below would pass
+    // whether or not the parse had done the work.
+    BPatch_function *caller = findOne(img, "toc_chain");
+    check(caller != NULL, exclude ? "toc_chain parsed on demand"
+                                  : "toc_chain found");
+    if (!caller)
+        return 1;
+
+    std::vector<BPatch_point *> *calls = caller->findPoint(BPatch_subroutine);
+    check(calls != NULL && !calls->empty(), "toc_chain has a call site");
+    if (!calls || calls->empty())
+        return 1;
+
+    std::string seen;
+    bool named = false;
+    for (size_t i = 0; i < calls->size(); i++)  {
+        BPatch_function *callee = (*calls)[i]->getCalledFunction();
+        std::string name = callee ? callee->getName() : std::string("<none>");
+        if (!seen.empty())
+            seen += ", ";
+        seen += name;
+        if (name == "toc_leaf")
+            named = true;
+    }
+
+    check(named, "the call names toc_leaf, not a function invented for it");
+    if (!named)  {
+        // Worth printing: the name it did get says which way it went wrong.
+        // targ<hex> is the parser's name for code it reached with no symbol on
+        // it, and on ppc64 the address in it should be eight past toc_leaf.
+        std::printf("      callees seen: %s\n", seen.c_str());
+        for (size_t i = 0; i < calls->size(); i++)
+            std::printf("      getCalledFunctionName: %s\n",
+                        (*calls)[i]->getCalledFunctionName().c_str());
+    }
+
+    // The callee is a function in its own right, not just a name on a call
+    // site: whatever the parse built there has to be instrumentable.
+    BPatch_function *leaf = calls->empty() ? NULL : (*calls)[0]->getCalledFunction();
+    std::vector<BPatch_point *> *entry = leaf ? leaf->findPoint(BPatch_entry) : NULL;
+    check(entry != NULL && !entry->empty(), "the callee has an entry point");
+    return 0;
+}
+
+
 // The worker: one scenario, one mode, in an already-prepared directory.
 static int runWorker(Scenario scenario, bool exclude)
 {
@@ -842,6 +930,9 @@ static int runWorker(Scenario scenario, bool exclude)
         break;
     case Scenario::Reopen:
         rc = sceneReopen(bpatch, exclude);
+        break;
+    case Scenario::Callee:
+        rc = sceneCallee(bpatch, exclude);
         break;
     }
 

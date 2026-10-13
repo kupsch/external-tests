@@ -31,6 +31,29 @@ int toc_marker(void)
     return 1;
 }
 
+/* A call that stays inside this library, for the ppc64 global/local entry
+   pair.  ELFv2 gives a function that uses the TOC two entry points -- a global
+   one that establishes r2 from r12, and a local one eight bytes later that
+   skips it -- and places the symbol on the global one.  A call the linker can
+   resolve within the object is aimed at the local entry, which no symbol
+   names.  Hidden visibility is what lets the linker resolve it: an exported
+   function is interposable, so a call to one goes through a PLT stub and
+   arrives at the global entry instead, which is not the case under test.
+   toc_leaf reaches global data so that it needs r2 and so has both entry
+   points at all. */
+__attribute__((visibility("hidden"), noinline))
+int toc_leaf(int x)
+{
+    return toc_global + toc_table[x & 3];
+}
+
+/* The addition keeps this from becoming a tail call, which would leave a
+   branch where the test wants a call site. */
+int toc_chain(int x)
+{
+    return toc_leaf(x) + toc_global;
+}
+
 /* Bulk, so that excluding this library removes a measurable number of basic
    blocks rather than a handful.  Each function below is several blocks, and
    there are two hundred of them. */
